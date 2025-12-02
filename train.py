@@ -59,6 +59,8 @@ def process_mesh_uvs(base_mesh, multi_materials=False):
             t_tex_idx=torch.tensor(indices_int64, dtype=torch.int64, device='cuda'),
             material=None
         )
+        new_mesh = mesh.auto_normals(new_mesh)
+        new_mesh = mesh.compute_tangents(new_mesh)
         return new_mesh, [0]
     else:
         unique_mats = np.unique(mat_indices)
@@ -72,15 +74,12 @@ def process_mesh_uvs(base_mesh, multi_materials=False):
             mask = (mat_indices == m_id)
             sub_faces_global = t_pos_idx[mask]
 
-            # 提取子网格
             used_v, sub_faces_local = np.unique(sub_faces_global, return_inverse=True)
             sub_faces_local = sub_faces_local.reshape(-1, 3)
             sub_v_pos = v_pos[used_v]
 
-            # 独立 Parameterize
             vmapping, indices, uvs = xatlas.parametrize(sub_v_pos, sub_faces_local)
 
-            # 映射回原始位置并收集
             remapped_v_pos = sub_v_pos[vmapping]
             final_v.append(remapped_v_pos)
             final_uv.append(uvs)
@@ -114,7 +113,6 @@ def main():
 
     # [Input/Output]
     parser.add_argument('--config', type=str, default=None, help='Config JSON file')
-    # 修改：移除了 required=True，以便支持从 config 文件读取
     parser.add_argument('-rm', '--ref_mesh', type=str, default=None, help='High-poly reference')
     parser.add_argument('-bm', '--base_mesh', type=str, default=None, help='Low-poly target')
     parser.add_argument('-o', '--out-dir', type=str, default='out/baking_result')
@@ -142,6 +140,7 @@ def main():
     parser.add_argument('--envmap', type=str, default=None, help='HDR environment map path')
     parser.add_argument('--env_scale', type=float, default=1.0)
     parser.add_argument('--cam_radius_scale', type=float, default=2.0)
+    parser.add_argument('--cam_near_far', nargs=2, type=float, default=[0.1, 1000.0], help='Camera near and far planes')
     parser.add_argument('--background_rgb', nargs=3, type=float, default=[0.0, 0.0, 0.0])
     parser.add_argument('--display_interval', type=int, default=50)
     parser.add_argument('--save_interval', type=int, default=100)
@@ -155,13 +154,7 @@ def main():
         data = json.load(open(FLAGS.config, 'r'))
         for key in data:
             if hasattr(FLAGS, key):
-                # 仅覆盖存在的参数，或者在这里做类型检查
-                val = data[key]
-                # 特殊处理 list 类型参数，确保转换正确
-                if isinstance(val, list) and not isinstance(getattr(FLAGS, key), list):
-                    # 如果原参数不是list但config里是list（这通常不应该发生，除非是位置参数）
-                    pass
-                FLAGS.__dict__[key] = val
+                FLAGS.__dict__[key] = data[key]
 
     # 2. 手动检查必需参数
     if FLAGS.ref_mesh is None:
@@ -176,6 +169,7 @@ def main():
     print(f" Loss: {FLAGS.loss_type} (Smooth: {FLAGS.smooth_weight})")
     print(f" Multi-Mat: {FLAGS.multi_materials}")
     print(f" Texture Res: {FLAGS.texture_res}")
+    print(f" SPP: {FLAGS.spp} | Res: {FLAGS.train_res}")
     print(f"=============================\n")
 
     os.makedirs(FLAGS.out_dir, exist_ok=True)
@@ -218,16 +212,20 @@ def main():
     views = dummy_dataset.precomputed_views
     target_images = []
 
-    # Render loop
-    ref_spp = max(FLAGS.spp, 4)  # Higher quality for GT
+    ref_spp = FLAGS.spp
+
     with torch.no_grad():
         for i, view in enumerate(views):
+            print(f"DEBUG: Start rendering view {i}")
+
             if len(dummy_dataset.ref_meshes) == 1:
                 out = render.render_mesh(glctx, dummy_dataset.ref_meshes[0], view['mvp'], view['campos'], lgt,
                                          FLAGS.train_res, spp=ref_spp, msaa=True)
             else:
                 out = render.render_meshes(glctx, dummy_dataset.ref_meshes, view['mvp'], view['campos'], lgt,
                                            FLAGS.train_res, spp=ref_spp, msaa=True)
+            print(f"DEBUG: Finished rendering view {i}")
+
             target_images.append(out['shaded'].detach())
             if (i + 1) % 10 == 0: print(f"      Rendered {i + 1}/{len(views)}")
 
@@ -237,15 +235,20 @@ def main():
     train_mats, params = [], []
 
     for m_id in active_mat_ids:
-        # Gray initialization
+        # 1. 正常的 KD 纹理（用于优化）
         kd_init = torch.full((FLAGS.texture_res[0], FLAGS.texture_res[1], 3), 0.5, dtype=torch.float32, device='cuda')
+        # 2. [关键修复] 哑巴 KS 纹理 (纯黑, 1x1)，为了骗过 render.py 的检查
+        ks_init = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32, device='cuda')
+
         m = material.Material({
             'name': f'baked_mat_{m_id}',
-            'bsdf': 'kd',  # Unlit shader
-            'kd': texture.Texture2D(kd_init)
+            'bsdf': 'kd',
+            'kd': texture.Texture2D(kd_init),
+            'ks': texture.Texture2D(ks_init)  # 必须有这个，否则 shade() 函数会报错
         })
         train_mats.append(m)
-        params += list(m.parameters())
+        # 3. [关键] 只将 KD 加入优化器，不优化 KS
+        params += list(m['kd'].parameters())
 
     if len(train_mats) == 1 and not FLAGS.multi_materials:
         geometry.mesh.material = train_mats[0]
@@ -306,8 +309,9 @@ def main():
         if FLAGS.display_interval and it % FLAGS.display_interval == 0:
             with torch.no_grad():
                 # Visualize first item in batch
-                opt_v = composite_background(buffers['shaded'][0:1], bg_tensor)
-                ref_v = composite_background(target[0:1], bg_tensor)
+                idx = 0
+                opt_v = composite_background(buffers['shaded'][idx:idx + 1], bg_tensor)
+                ref_v = composite_background(target[idx:idx + 1], bg_tensor)
                 diff = torch.abs(opt_v - ref_v)
                 vis = torch.cat([opt_v, ref_v, diff], dim=2)
                 util.display_image(vis[0].detach().cpu().numpy(), title=f"Iter {it}")
@@ -318,8 +322,7 @@ def main():
     # PSNR Check
     total_psnr = 0.0
     count = 0
-    final_mesh = geometry.getMesh(None)  # Recalculate tangents if needed, though geometry is static here
-    # Assign correct material structure back to final mesh just in case
+    final_mesh = geometry.getMesh(None)
     if len(train_mats) == 1 and not FLAGS.multi_materials:
         final_mesh.material = train_mats[0]
         final_mesh.materials = None

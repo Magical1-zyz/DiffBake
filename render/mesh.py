@@ -94,12 +94,19 @@ class Mesh:
 
 def load_mesh(filename, mtl_override=None):
     name, ext = os.path.splitext(filename)
+    ext = ext.lower()  # 统一转小写，防止 .OBJ 识别失败
+
     if ext == ".obj":
+        # OBJ 走 obj.py，支持 MTL 材质解析
         return obj.load_obj(filename, clear_ks=True, mtl_override=mtl_override)
-    elif ext == ".gltf":
-        # Preserve original per-primitive/material assignments to support multi-material rendering
+
+    elif ext in [".gltf", ".glb"]:
+        # GLTF/GLB 走 gltf.py
+        # merge_materials=False 确保我们获取原始的多材质结构
         return gltf.load_gltf(filename, mtl_override=mtl_override, merge_materials=False)
-    assert False, "Invalid mesh file extension"
+
+    else:
+        raise ValueError(f"Unsupported mesh format: '{ext}'. Please use .obj, .gltf, or .glb")
 
 
 ######################################################################################

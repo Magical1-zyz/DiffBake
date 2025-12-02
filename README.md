@@ -1,6 +1,6 @@
 # DiffBake: Differentiable Texture Baking
 
-![Teaser image](images/teaser.jpg) **DiffBake** 是一个基于 [nvdiffrec](https://github.com/NVlabs/nvdiffrec) 深度精简与改良的高性能纹理烘焙工具。
+**DiffBake** 是一个基于 [nvdiffrec](https://github.com/NVlabs/nvdiffrec) 深度精简与改良的高性能纹理烘焙工具。
 
 它利用可微渲染（Differentiable Rendering）技术，将高模（Reference Mesh）的**光影、材质和细节**精确地“烘焙”到低模（Base Mesh）的 Diffuse 贴图上。不同于传统的烘焙工具，DiffBake 通过梯度下降算法直接优化纹理像素，能够生成像素级对齐（Pixel-perfect）、边缘锐利且抗锯齿的高质量贴图。
 
@@ -146,17 +146,4 @@ DiffBake (`train_bake.py`) 支持多种参数来控制输入输出、烘焙质�
 
 本项目修改自 NVIDIA 的开源项目 **nvdiffrec**。核心可微渲染逻辑归原作者所有。
 
-如果您在研究中使用了本项目，请引用原始论文：
-
-```bibtex
-@inproceedings{Munkberg_2022_CVPR,
-    author    = {Munkberg, Jacob and Hasselgren, Jon and Shen, Tianchang and Gao, Jun and Chen, Wenzheng 
-                    and Evans, Alex and M\"uller, Thomas and Fidler, Sanja},
-    title     = "{Extracting Triangular 3D Models, Materials, and Lighting From Images}",
-    booktitle = {Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
-    month     = {June},
-    year      = {2022},
-    pages     = {8280-8290}
-}
-```
 特别感谢 xatlas 提供的优秀 UV 展开算法。

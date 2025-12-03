@@ -33,7 +33,7 @@ activate diffbake
 2. 安装基础依赖:
 ```Bash
 conda install pytorch torchvision torchaudio cudatoolkit=11.8 -c pytorch
-pip install ninja imageio xatlas gdown
+pip install ninja imageio xatlas gdown opencv-python matplotlib pygltflib
 ```
 
 3. 安装核心渲染库:

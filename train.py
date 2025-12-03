@@ -41,12 +41,13 @@ def composite_background(image_rgba, bg_color):
 @torch.no_grad()
 def generate_heatmap(opt_rgb, ref_rgb, mask, bg_color_tensor):
     """
-    生成带标签的红蓝热力图，并与统一背景合成 (标签在底部)
+    生成带标签的红蓝热力图，并与统一背景合成
+    布局：[左下角] Max Err: X.XXXX [红----->蓝] 0
     """
     # 1. 计算误差
     diff = torch.abs(opt_rgb - ref_rgb) * mask
 
-    # 转 Numpy (注意：这里取 [0] 是假设 batch=1 或只取第一个)
+    # 转 Numpy
     diff_gray = torch.mean(diff, dim=-1)[0].detach().cpu().numpy()
     mask_np = mask[0, ..., 0].detach().cpu().numpy()
     bg_np = bg_color_tensor.detach().cpu().numpy()
@@ -56,28 +57,25 @@ def generate_heatmap(opt_rgb, ref_rgb, mask, bg_color_tensor):
     if max_err < 1e-6: max_err = 1.0
     norm_diff = np.clip(diff_gray / max_err, 0.0, 1.0)
 
-    # 3. 颜色映射 (Jet: Blue->Red)
+    # 3. 应用 Jet Colormap (Blue->Red)
     heatmap_rgba = matplotlib.cm.jet(norm_diff)
     heatmap_rgb = heatmap_rgba[..., :3]
 
-    # 4. 背景合成
+    # 4. 与背景合成
     heatmap_vis = heatmap_rgb * mask_np[..., None] + bg_np[None, None, :] * (1.0 - mask_np[..., None])
 
-    # 5. 绘制标签 (使用 OpenCV)
+    # 5. 准备画布
     heatmap_u8 = (np.clip(heatmap_vis, 0, 1) * 255).astype(np.uint8)
     heatmap_u8 = np.ascontiguousarray(heatmap_u8)
 
-    # [修复点] 确保维度正确后再解包
-    if heatmap_u8.ndim == 3:
-        h, w, _ = heatmap_u8.shape
-    else:
-        # 如果意外传入了 batch 维，尝试压缩
-        heatmap_u8 = heatmap_u8.squeeze()
-        h, w, _ = heatmap_u8.shape
+    if heatmap_u8.ndim == 4: heatmap_u8 = heatmap_u8[0]
+    h, w, _ = heatmap_u8.shape
 
+    # 字体设置
     label = f"Max Err: {max_err:.4f}"
     font = cv2.FONT_HERSHEY_SIMPLEX
 
+    # 字体颜色
     if np.mean(bg_np) > 0.5:
         text_color = (0, 0, 0);
         outline_color = (255, 255, 255)
@@ -85,16 +83,51 @@ def generate_heatmap(opt_rgb, ref_rgb, mask, bg_color_tensor):
         text_color = (255, 255, 255);
         outline_color = (0, 0, 0)
 
-    scale = max(0.6, w / 800.0)
+    # 自适应缩放
+    scale = max(0.6, w / 1000.0)
     thickness = max(1, int(scale * 2))
 
-    margin_x = int(20 * scale)
-    margin_y = int(20 * scale)
-    x_pos = margin_x
-    y_pos = h - margin_y
+    # 计算文字大小
+    (text_w, text_h), baseline = cv2.getTextSize(label, font, scale, thickness)
 
-    cv2.putText(heatmap_u8, label, (x_pos, y_pos), font, scale, outline_color, thickness + 2, cv2.LINE_AA)
-    cv2.putText(heatmap_u8, label, (x_pos, y_pos), font, scale, text_color, thickness, cv2.LINE_AA)
+    # ---------------------------------------------------------
+    # 布局计算 (左下角)
+    # ---------------------------------------------------------
+    margin = int(20 * scale)
+    x_text = margin
+    y_text = h - margin  # 文字基线位置
+
+    # 1. 绘制文字 "Max Err: X.XX"
+    cv2.putText(heatmap_u8, label, (x_text, y_text), font, scale, outline_color, thickness + 2, cv2.LINE_AA)
+    cv2.putText(heatmap_u8, label, (x_text, y_text), font, scale, text_color, thickness, cv2.LINE_AA)
+
+    # 2. 绘制水平色带 (紧跟文字右侧)
+    # 只有当有足够空间时才绘制
+    bar_x = x_text + text_w + int(15 * scale)  # 文字右侧 15px
+    bar_y = y_text - text_h  # 与文字顶部对齐
+    bar_h = text_h  # 高度与文字一致
+    bar_w = int(w * 0.25)  # 宽度占画布 25%
+
+    if bar_x + bar_w < w - margin:
+        # 生成水平渐变: 1.0(Red) -> 0.0(Blue)
+        gradient = np.linspace(1, 0, bar_w)
+        bar_color = matplotlib.cm.jet(gradient)[:, :3]  # [W, 3]
+        bar_color = (bar_color * 255).astype(np.uint8)
+
+        # 扩展高度: [W, 3] -> [1, W, 3] -> [H, W, 3]
+        bar_img = np.tile(bar_color[None, :, :], (bar_h, 1, 1))
+
+        # 贴图
+        heatmap_u8[bar_y:bar_y + bar_h, bar_x:bar_x + bar_w] = bar_img
+
+        # 边框
+        cv2.rectangle(heatmap_u8, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), outline_color, 1)
+
+        # 3. 绘制末端 "0" 标签
+        label_0 = "0"
+        cv2.putText(heatmap_u8, label_0, (bar_x + bar_w + 5, y_text), font, scale, outline_color, thickness + 2,
+                    cv2.LINE_AA)
+        cv2.putText(heatmap_u8, label_0, (bar_x + bar_w + 5, y_text), font, scale, text_color, thickness, cv2.LINE_AA)
 
     return torch.from_numpy(heatmap_u8.astype(np.float32) / 255.0).to(opt_rgb.device).unsqueeze(0)
 
@@ -103,6 +136,7 @@ def process_mesh_uvs(base_mesh, multi_materials=False, use_custom_uv=False):
     """
     处理 UV 和 材质分组逻辑。
     """
+    # 标准转换
     v_pos = base_mesh.v_pos.detach().cpu().numpy()
     t_pos_idx = base_mesh.t_pos_idx.detach().cpu().numpy()
 
@@ -112,6 +146,7 @@ def process_mesh_uvs(base_mesh, multi_materials=False, use_custom_uv=False):
     if base_mesh.face_material_idx is not None:
         mat_indices = base_mesh.face_material_idx.detach().cpu().numpy()
 
+    # 模式 A: 使用原有 UV
     if use_custom_uv:
         if not has_uv:
             raise ValueError("Requested --use_custom_uv but the mesh has no UVs!")
@@ -123,6 +158,7 @@ def process_mesh_uvs(base_mesh, multi_materials=False, use_custom_uv=False):
             base_mesh.face_material_idx = torch.zeros_like(base_mesh.face_material_idx)
             return base_mesh, [0]
 
+    # 模式 B: xatlas 自动展开
     if not multi_materials:
         print(f"      [UV] Mode: Single Material Atlas (Running xatlas...)")
         start_x = time.time()
@@ -397,11 +433,17 @@ def main():
                 idx = 0
                 opt_v = composite_background(buffers['shaded'][idx:idx + 1], bg_tensor)
                 ref_v = composite_background(target[idx:idx + 1], bg_tensor)
+
+                # [重要] 转为 sRGB
+                opt_v_srgb = util.rgb_to_srgb(opt_v)
+                ref_v_srgb = util.rgb_to_srgb(ref_v)
+
                 mask_v = target[idx:idx + 1, ..., 3:4]
+                # 热力图使用 Linear 空间数据计算
                 diff_v = generate_heatmap(buffers['shaded'][idx:idx + 1, ..., 0:3], target[idx:idx + 1, ..., 0:3],
                                           mask_v, bg_tensor)
 
-                vis = torch.cat([opt_v, ref_v, diff_v], dim=2)
+                vis = torch.cat([opt_v_srgb, ref_v_srgb, diff_v], dim=2)
 
                 if do_save:
                     for i, m in enumerate(train_mats):
@@ -459,21 +501,22 @@ def main():
     else:
         gltf.save_gltf(save_path, final_mesh, diffuse_only=True)
 
-    # 修复后的最后一张对比图保存逻辑
     with torch.no_grad():
-        # 取出最后一张 Ground Truth (已是 4D 张量 [1, H, W, 4])
-        ref_img_last = target_images[len(views) - 1]
+        # 最后一张对比图
+        last_idx = len(views) - 1
+        opt_img = buffers['shaded'][0:1]  # 复用上面循环最后一次渲染结果 (正好是最后一张)
+        ref_img = target_images[last_idx]  # 已经是 4D
 
-        vis_opt = composite_background(buffers['shaded'][0:1], bg_tensor)
-        vis_ref = composite_background(ref_img_last, bg_tensor)
+        vis_opt = composite_background(opt_img, bg_tensor)
+        vis_ref = composite_background(ref_img, bg_tensor)
 
-        vis_diff = generate_heatmap(
-            buffers['shaded'][..., 0:3],
-            ref_img_last[..., 0:3],
-            ref_img_last[..., 3:4],
-            bg_tensor
-        )
-        final_comp = torch.cat([vis_opt, vis_ref, vis_diff], dim=2)
+        # 转 sRGB
+        vis_opt_srgb = util.rgb_to_srgb(vis_opt)
+        vis_ref_srgb = util.rgb_to_srgb(vis_ref)
+
+        vis_diff = generate_heatmap(opt_img[..., 0:3], ref_img[..., 0:3], ref_img[..., 3:4], bg_tensor)
+
+        final_comp = torch.cat([vis_opt_srgb, vis_ref_srgb, vis_diff], dim=2)
         util.save_image(os.path.join(FLAGS.out_dir, "final_comparison.png"), final_comp[0].detach().cpu().numpy())
 
     print(f"Saved to {save_path}")

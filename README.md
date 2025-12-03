@@ -4,6 +4,9 @@
 
 它利用可微渲染（Differentiable Rendering）技术，将高模（Reference Mesh）的**光影、材质和细节**精确地“烘焙”到低模（Base Mesh）的 Diffuse 贴图上。不同于传统的烘焙工具，DiffBake 通过梯度下降算法直接优化纹理像素，能够生成像素级对齐（Pixel-perfect）、边缘锐利且抗锯齿的高质量贴图。
 
+## 效果展示
+以下是使用 DiffBake 将高模烘焙到低模的示例结果：
+![img.png](image/img.png)
 ## 核心特性 (Features)
 
 - **🚀 极速显存预渲染 (VRAM Pre-rendering)**: 预先将高模的 Ground Truth 渲染至显存，训练过程无需重复渲染高模，速度提升 5x 以上。

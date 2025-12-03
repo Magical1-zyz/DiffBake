@@ -151,6 +151,6 @@ DiffBake (`train_bake.py`) 支持多种参数来控制输入输出、烘焙质�
 
 ## 引用与致谢 (Citation & Acknowledgement)
 
-本项目修改自 NVIDIA 的开源项目 **nvdiffrec**。核心可微渲染逻辑归原作者所有。
+本项目修改自 NVIDIA 的开源项目 **[nvdiffrec](https://github.com/NVlabs/nvdiffrec)**。核心可微渲染逻辑归原作者所有。
 
 特别感谢 xatlas 提供的优秀 UV 展开算法。

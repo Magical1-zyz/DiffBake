@@ -662,6 +662,7 @@ def main():
         util.save_image(os.path.join(FLAGS.out_dir, "final_comparison.png"), final_comp[0].detach().cpu().numpy())
 
     print(f"Saved to {save_path}")
+    print(f"Total time: {time.time() - start_t:.2f}s")
     print("[Done]")
 
 

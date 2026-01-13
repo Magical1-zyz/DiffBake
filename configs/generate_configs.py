@@ -14,7 +14,7 @@ TEMPLATE_CONFIG = {
     "texture_res": [2048, 2048],
 
     "use_opt_pbr": True,
-    "bake_mode": "full_pbr",
+    "bake_mode": "color_only",
 
     "iter": 3000,
     "batch": 4,
@@ -32,8 +32,8 @@ TEMPLATE_CONFIG = {
 
     "cam_radius_scale": 2.0,
     "cam_near_far": [0.1, 1000.0],
-    "cam_views_top": 96,
-    "cam_views_bottom": 32,
+    "cam_views_top": 64,
+    "cam_views_bottom": 16,
 
     "save_interval": 100,
     "display_interval": 50,
@@ -53,33 +53,33 @@ def main():
     # 获取项目根目录 (configs 的上一级)
     project_root = os.path.dirname(current_dir)
     # data 目录路径
-    data_dir = os.path.join(project_root, 'data')
+    models_root_dir = os.path.join(project_root, 'data', 'models')
 
-    if not os.path.exists(data_dir):
-        print(f"错误: 找不到 data 目录: {data_dir}")
+    if not os.path.exists(models_root_dir):
+        print(f"错误: 找不到模型目录: {models_root_dir}")
+        print("请确认您的目录结构是否为: DiffBake/data/models/模型名/模型文件")
         return
 
-    print(f"正在扫描 data 目录: {data_dir} ...")
+    print(f"正在扫描 data 目录: {models_root_dir} ...")
 
-    # 2. 遍历 data 目录下的所有文件夹
+    # 2. 遍历 data/models 目录下的所有文件夹
     count = 0
-    for folder_name in os.listdir(data_dir):
-        folder_path = os.path.join(data_dir, folder_name)
+    for folder_name in os.listdir(models_root_dir):
+        folder_path = os.path.join(models_root_dir, folder_name)
 
-        # 确保是文件夹而非文件
         if not os.path.isdir(folder_path):
             continue
 
-        # 3. 定义目标 JSON 文件名
+        # 3. 定义目标 JSON 文件名 (保存在 configs/ 下)
         json_filename = f"{folder_name}.json"
         json_path = os.path.join(current_dir, json_filename)
 
-        # 4. 检查是否已存在，存在则跳过
+        # 4. 检查是否存在
         if os.path.exists(json_path):
             print(f"[跳过] {json_filename} 已存在")
             continue
 
-        # 5. 寻找模型文件 (优先寻找与文件夹同名的文件)
+        # 5. 寻找模型文件
         model_filename = None
         for ext in SUPPORTED_EXTENSIONS:
             potential_name = f"{folder_name}{ext}"
@@ -87,7 +87,6 @@ def main():
                 model_filename = potential_name
                 break
 
-        # 如果找不到同名文件，尝试找任何支持的格式 (可选逻辑)
         if model_filename is None:
             for f in os.listdir(folder_path):
                 if any(f.lower().endswith(ext) for ext in SUPPORTED_EXTENSIONS):
@@ -95,20 +94,21 @@ def main():
                     break
 
         if model_filename is None:
-            print(f"[警告] 在 {folder_name} 中未找到支持的模型文件 (.gltf/.glb/.obj)，已跳过。")
+            print(f"[警告] 在 {folder_name} 中未找到支持的模型文件，已跳过。")
             continue
 
         # 6. 生成配置内容
-        # 使用 forward slashes (/) 以兼容 JSON 格式和跨平台
-        model_rel_path = f"data/{folder_name}/{model_filename}"
-        out_dir_path = f"out/baking_opt_pbr/{folder_name}"
+        model_rel_path = f"data/models/{folder_name}/{model_filename}"
+
+        # 输出路径
+        out_dir_path = f"out/baking_opt_color/{folder_name}"
 
         new_config = TEMPLATE_CONFIG.copy()
         new_config["base_mesh"] = model_rel_path
         new_config["ref_mesh"] = model_rel_path
         new_config["out_dir"] = out_dir_path
 
-        # 7. 写入 JSON 文件
+        # 7. 写入 JSON
         try:
             with open(json_path, 'w', encoding='utf-8') as f:
                 json.dump(new_config, f, indent=4)

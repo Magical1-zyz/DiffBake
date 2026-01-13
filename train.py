@@ -508,7 +508,11 @@ def main():
     print(f"[Info] Exporting initial mesh state...")
     init_save_path = os.path.join(FLAGS.out_dir, "initial_mesh")
     os.makedirs(init_save_path, exist_ok=True)
-    gltf.save_gltf(init_save_path, geometry.mesh, diffuse_only=True)  # 初始只存diffuse
+
+    if len(train_mats) > 1 or FLAGS.multi_materials:
+        gltf.save_gltf_multi(init_save_path, geometry.mesh, diffuse_only=True)
+    else:
+        gltf.save_gltf(init_save_path, geometry.mesh, diffuse_only=True)
 
     optimizer = torch.optim.Adam(params, lr=FLAGS.lr)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda x: max(0.0, 10 ** (-x * 0.0002)))

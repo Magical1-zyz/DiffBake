@@ -4,30 +4,26 @@ import subprocess
 import time
 import glob
 
-# =================配置区域=================
+# ================= 配置区域 =================
 
 # 模式 A: 手动指定要运行的 Config 文件列表 (相对路径)
-# 优先级最高。如果这里有内容，就会忽略模式 B。
+# 优先级最高。如果这里有内容 (不为空)，脚本将只运行列表里的文件，忽略模式 B。
+# 示例: ["configs/SM_RedHouse.json", "configs/SM_Building.json"]
 MANUAL_CONFIG_LIST = [
-    "configs/SM_Bp_Building01_C_1.json",
-    "configs/SM_Bp_Building02_C_1.json",
-    "configs/SM_Bp_Building03_C_1.json",
-    "configs/SM_Bp_Building04_C_1.json",
-    "configs/SM_Bp_Building05_C_1.json",
-    "configs/SM_Bp_Building06_C_1.json",
-    "configs/SM_Bp_Building07_C_1.json",
-    "configs/SM_Bp_Building08_C_1.json",
-    "configs/SM_Bp_Building09_C_1.json",
-    "configs/SM_Bp_Building10_C_1.json"
+
 ]
 
 # 模式 B: 自动扫描文件夹
-# 如果 MANUAL_CONFIG_LIST 为空，脚本会自动扫描该目录下所有符合条件的文件
+# 如果 MANUAL_CONFIG_LIST 为空，脚本会自动扫描该目录下所有 .json 文件
 AUTO_SCAN_DIR = "configs"
-AUTO_SCAN_PREFIX = "bake_"  # 只运行以此开头的json，防止运行错误的配置
-AUTO_SCAN_SUFFIX = ".json"
 
-# Python解释器路径 (通常直接用 'python' 即可，如果是特定环境可指定绝对路径)
+# 排除列表 (文件名): 在自动扫描模式下，如果你想跳过某些特定的 JSON 文件，写在这里
+# 示例: ["template.json", "base_config.json"]
+EXCLUDE_FILES = [
+
+]
+
+# Python解释器路径
 PYTHON_EXECUTABLE = sys.executable
 
 
@@ -38,10 +34,9 @@ def run_command(command):
     print(f"\n[Batch] Executing: {command}")
     print("-" * 60)
 
-    # 使用 subprocess.run 调用，check=True 会在失败时抛出异常
     try:
-        # shell=True 在 Windows 下通常是必须的
         start_time = time.time()
+        # Windows下通常需要 shell=True
         result = subprocess.run(command, shell=True, check=True)
         duration = time.time() - start_time
         return True, duration
@@ -62,17 +57,27 @@ def main():
         tasks = MANUAL_CONFIG_LIST
     else:
         print(f"[Batch] Mode: Auto Scan directory '{AUTO_SCAN_DIR}'")
-        search_pattern = os.path.join(AUTO_SCAN_DIR, f"{AUTO_SCAN_PREFIX}*{AUTO_SCAN_SUFFIX}")
+        # 直接匹配所有 .json 文件
+        search_pattern = os.path.join(AUTO_SCAN_DIR, "*.json")
         files = glob.glob(search_pattern)
-        # 按文件名排序，保证顺序一致
+
+        # 过滤排除列表
+        files = [f for f in files if os.path.basename(f) not in EXCLUDE_FILES]
+
+        # 按文件名排序，保证执行顺序一致
         tasks = sorted(files)
-        print(f"[Batch] Found {len(tasks)} configs: {[os.path.basename(f) for f in tasks]}")
+        print(f"[Batch] Found {len(tasks)} configs.")
 
     if not tasks:
         print("[Batch] No config files found to run.")
+        print(f"        Please check directory: {AUTO_SCAN_DIR}")
         return
 
-    print(f"\n[Batch] Start processing {len(tasks)} tasks...")
+    print(f"\n[Batch] Task Queue:")
+    for idx, t in enumerate(tasks):
+        print(f"  {idx + 1}. {t}")
+
+    print("\n[Batch] Start processing...")
     print("=" * 60)
 
     # 2. 循环执行
@@ -87,12 +92,12 @@ def main():
         if not os.path.exists(config_path):
             print(f"[Batch] Skipping {config_path}: File not found.")
             fail_list.append(config_path)
+            report.append((config_path, "0.0s", "MISSING"))
             continue
 
         print(f"\n>>> Task {i + 1}/{len(tasks)}: {config_path}")
 
-        # 构造命令： python train.py --config xxx.json
-        # 这里的 train.py 对应你实际的主程序文件名
+        # 构造命令
         cmd = f'"{PYTHON_EXECUTABLE}" train.py --config "{config_path}"'
 
         # 执行
@@ -107,8 +112,9 @@ def main():
             report.append((config_path, "0.0s", "FAILED"))
             print(f">>> Task {i + 1} FAILED. Continuing to next task...")
 
-        # (可选) 可以在这里加一个简短的 sleep 让显卡喘口气
-        time.sleep(2)
+        # (可选) 任务间隔休息，防止显卡过热
+        if i < len(tasks) - 1:
+            time.sleep(2)
 
     # 3. 最终总结
     total_duration = time.time() - total_start
@@ -118,10 +124,17 @@ def main():
     print(f"Success: {success_count} | Failed: {len(fail_list)}")
     print("-" * 60)
 
-    print(f"{'Config File':<40} | {'Time':<10} | {'Status'}")
-    print("-" * 60)
+    # 打印格式化的报告表
+    # 动态调整列宽以适应长文件名
+    max_name_len = max([len(t[0]) for t in report]) if report else 40
+    max_name_len = max(max_name_len, 20)  # 最小宽度
+
+    header = f"{'Config File':<{max_name_len}} | {'Time':<10} | {'Status'}"
+    print(header)
+    print("-" * len(header))
+
     for name, time_str, status in report:
-        print(f"{name:<40} | {time_str:<10} | {status}")
+        print(f"{name:<{max_name_len}} | {time_str:<10} | {status}")
     print("=" * 60)
 
 

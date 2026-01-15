@@ -189,6 +189,21 @@ def generate_heatmap(opt_rgb, ref_rgb, mask, bg_color_tensor):
     return torch.from_numpy(heatmap_u8.astype(np.float32) / 255.0).to(opt_rgb.device).unsqueeze(0)
 
 
+# 模型数据验证
+def validate_mesh_data(mesh_obj, name="Mesh"):
+    if mesh_obj is None: raise ValueError(f"{name} is None!")
+    v_count = mesh_obj.v_pos.shape[0]
+    f_count = mesh_obj.t_pos_idx.shape[0]
+    if v_count == 0: raise ValueError(f"{name} error: 0 vertices.")
+    if f_count == 0: raise ValueError(f"{name} error: 0 faces.")
+    if torch.isnan(mesh_obj.v_pos).any() or torch.isinf(mesh_obj.v_pos).any():
+        raise ValueError(f"{name} error: v_pos contains NaN or Inf.")
+    max_idx = mesh_obj.t_pos_idx.max()
+    if max_idx >= v_count:
+        raise ValueError(f"{name} error: Face index {max_idx} out of bounds (v_pos size: {v_count})")
+    print(f"      [Check] {name} valid. V: {v_count}, F: {f_count}")
+
+
 def process_mesh_uvs(base_mesh, multi_materials=False, use_custom_uv=False):
     """
     处理 UV 和 材质分组逻辑。
@@ -412,9 +427,11 @@ def main():
     ref_mesh = mesh.load_mesh(FLAGS.ref_mesh)
     ref_mesh = mesh.auto_normals(ref_mesh)
     ref_mesh = mesh.compute_tangents(ref_mesh)
+    validate_mesh_data(ref_mesh, "Reference Mesh")
 
     temp_base = mesh.load_mesh(FLAGS.base_mesh)
     base_mesh, active_mat_ids = process_mesh_uvs(temp_base, FLAGS.multi_materials, FLAGS.use_custom_uv)
+    validate_mesh_data(base_mesh, "Base Mesh")
 
     with torch.no_grad():
         ref_min, ref_max = mesh.aabb(ref_mesh)
@@ -522,16 +539,24 @@ def main():
     print(f"[4/5] Baking...")
     start_t = time.time()
 
+    # 梯度累积配置
+    # config 中的 batch 作为 "Virtual Batch" (累积多少次更新一次权重)
+    # physical_batch_size 强制为 1，确保最低显存占用
+    virtual_batch_size = FLAGS.batch
+    physical_batch_size = 1
+
     def get_batch(n, b):
         while True:
             perm = np.random.permutation(n)
             for i in range(0, n, b):
                 yield perm[i:i + b]
 
-    idx_gen = get_batch(len(views), FLAGS.batch)
+    idx_gen = get_batch(len(views), virtual_batch_size)
 
     for it in range(FLAGS.iter + 1):
         optimizer.zero_grad()
+
+        # 获取这一轮要处理的总索引 (例如 8 张图)
         idxs = next(idx_gen)
 
         curr_res = FLAGS.train_res
@@ -544,26 +569,52 @@ def main():
                 curr_res = [r // 2 for r in FLAGS.train_res]
                 curr_spp = max(1, FLAGS.spp // 2)
 
-        mvp = torch.cat([views[i]['mvp'] for i in idxs])
-        campos = torch.cat([views[i]['campos'] for i in idxs])
-        # 临时搬运回 GPU
-        target = torch.cat([target_images[i].to('cuda', non_blocking=True) for i in idxs])
+        total_loss_val = 0.0
 
-        if target.shape[1] != curr_res[0] or target.shape[2] != curr_res[1]:
-            target_nchw = target.permute(0, 3, 1, 2)
-            target_down = torch.nn.functional.interpolate(target_nchw, size=curr_res, mode='bilinear',
-                                                          align_corners=False)
-            target = target_down.permute(0, 2, 3, 1)
+        # 将大 Batch 拆分成微批次 (Micro-batches)，这里每次只跑 1 张
+        # 例如 idxs=[0,1,2,3], 拆分为 [0], [1], [2], [3]
+        sub_batches = [idxs[i:i + physical_batch_size] for i in range(0, len(idxs), physical_batch_size)]
 
-        with torch.cuda.amp.autocast(enabled=FLAGS.amp):
-            buffers = render.render_mesh(glctx, geometry.mesh, mvp, campos, lgt, curr_res, spp=curr_spp, msaa=True,
-                                         bsdf=target_bsdf)
-            loss, stats = criterion(buffers['shaded'], target, buffers.get('kd_grad', None))
+        # 梯度累积循环
+        for sub_idx in sub_batches:
+            # 1. 准备单张图片的数据
+            mvp = torch.cat([views[i]['mvp'] for i in sub_idx])
+            campos = torch.cat([views[i]['campos'] for i in sub_idx])
+            target = torch.cat([target_images[i].to('cuda', non_blocking=True) for i in sub_idx])
 
-        scaler.scale(loss).backward()
+            # Resize 目标图 (如果是 coarse 阶段)
+            if target.shape[1] != curr_res[0] or target.shape[2] != curr_res[1]:
+                target_nchw = target.permute(0, 3, 1, 2)
+                target_down = torch.nn.functional.interpolate(target_nchw, size=curr_res, mode='bilinear',
+                                                              align_corners=False)
+                target = target_down.permute(0, 2, 3, 1)
+
+            with torch.amp.autocast('cuda', enabled=FLAGS.amp):
+                # 2. 渲染
+                buffers = render.render_mesh(glctx, geometry.mesh, mvp, campos, lgt, curr_res, spp=curr_spp, msaa=True,
+                                             bsdf=target_bsdf)
+                # 3. 计算 Loss
+                loss, stats = criterion(buffers['shaded'], target, buffers.get('kd_grad', None))
+
+                # [关键] 归一化 Loss：除以累积步数，保证梯度幅值正确
+                loss = loss / len(sub_batches)
+
+            # 4. 反向传播 (积累梯度)
+            scaler.scale(loss).backward()
+
+            total_loss_val += loss.item() * len(sub_batches)  # 还原用于打印的 loss
+
+            # 5. [关键] 立即释放中间变量显存
+            del buffers, target, loss, mvp, campos
+
+        # 所有微批次跑完后，执行一步优化
         scaler.step(optimizer)
         scaler.update()
         scheduler.step()
+
+        # 定期清理显存碎片
+        if it % 50 == 0:
+            torch.cuda.empty_cache()
 
         with torch.no_grad():
             for m in train_mats:
@@ -574,73 +625,60 @@ def main():
                     # 但为了安全通常不需要 clamp (0,1)
 
         if it % 50 == 0:
-            print(
-                f"      Iter {it:04d} [{curr_res[0]}x{curr_res[1]}] | Loss: {loss.item():.6f} (Main: {stats['main']:.6f}, Reg: {stats['reg']:.6f})")
+            # 这里打印的 Loss 是累积后的总 Loss，等价于普通 Batch 模式下的 Loss
+            print(f"      Iter {it:04d} [{curr_res[0]}x{curr_res[1]}] | Loss: {total_loss_val / len(sub_batches):.6f}")
 
-        do_save = (FLAGS.save_interval and it % FLAGS.save_interval == 0)
-        do_display = (FLAGS.display_interval and it % FLAGS.display_interval == 0)
-
-        if do_save or do_display:
+        # 可视化/保存逻辑
+        if (FLAGS.save_interval and it % FLAGS.save_interval == 0) or (
+                FLAGS.display_interval and it % FLAGS.display_interval == 0):
             with torch.no_grad():
-                idx = 0
-                opt_v = composite_background(buffers['shaded'][idx:idx + 1], bg_tensor)
-                ref_v = composite_background(target[idx:idx + 1], bg_tensor)
+                # 为了不占用显存，我们只重新渲染第一张图用于预览
+                idx = 0;
+                view_id = idxs[idx];
+                view_data = views[view_id]
+                mvp = view_data['mvp'];
+                campos = view_data['campos']
 
-                # 动态决定背景内容
+                # 临时渲染一张
+                buffers = render.render_mesh(glctx, geometry.mesh, mvp, campos, lgt, curr_res, spp=curr_spp,
+                                             msaa=True, bsdf=target_bsdf)
+                opt_v = buffers['shaded']
+
+                ref_v = target_images[view_id].to('cuda', non_blocking=True)
+                if ref_v.shape[1] != curr_res[0]:
+                    ref_v = torch.nn.functional.interpolate(ref_v.permute(0, 3, 1, 2), size=curr_res,
+                                                            mode='bilinear').permute(0, 2, 3, 1)
+
                 if FLAGS.render_env_bg and FLAGS.envmap:
-                    # 使用当前视角的参数渲染环境背景
-                    view_id = idxs[idx]  # 获取当前样本对应的全局视角ID
-                    view_data = views[view_id]
                     bg_img = render_env_background(lgt, curr_res, view_data['mv'], view_data['fovy'])
                 else:
-                    # 使用纯色背景
                     bg_img = bg_tensor.view(1, 1, 1, 3)
 
-                # 合成
                 vis_opt = composite_background(opt_v, bg_img)
                 vis_ref = composite_background(ref_v, bg_img)
-
-                # Reinhard 色调映射，解决过曝问题
-                vis_opt = vis_opt / (1.0 + vis_opt)
+                vis_opt = vis_opt / (1.0 + vis_opt);
                 vis_ref = vis_ref / (1.0 + vis_ref)
+                vis_opt_srgb = util.rgb_to_srgb(vis_opt);
+                vis_ref_srgb = util.rgb_to_srgb(vis_ref)
+                mask_v = ref_v[..., 3:4]
+                diff_v = generate_heatmap(buffers['shaded'][..., 0:3], ref_v[..., 0:3], mask_v, bg_tensor)
+                vis = torch.cat([vis_opt_srgb, vis_ref_srgb, diff_v], dim=2)
 
-                # 转为 sRGB
-                opt_v_srgb = util.rgb_to_srgb(vis_opt)
-                ref_v_srgb = util.rgb_to_srgb(vis_ref)
-
-                mask_v = target[idx:idx + 1, ..., 3:4]
-                # 热力图使用 Linear 空间数据计算
-                diff_v = generate_heatmap(buffers['shaded'][idx:idx + 1, ..., 0:3], target[idx:idx + 1, ..., 0:3],
-                                          mask_v, bg_tensor)
-
-                vis = torch.cat([opt_v_srgb, ref_v_srgb, diff_v], dim=2)
-
-                if do_save:
+                if FLAGS.save_interval and it % FLAGS.save_interval == 0:
                     for i, m in enumerate(train_mats):
                         suffix = f"_mat{i}" if len(train_mats) > 1 else ""
-                        filename = os.path.join(FLAGS.out_dir, f"progress_kd{suffix}_{it:04d}.png")
-                        texture.save_texture2D(filename, texture.rgb_to_srgb(m['kd']))
-                        # 只在 full_pbr 模式下保存 ks 和 normal
+                        texture.save_texture2D(os.path.join(FLAGS.out_dir, f"progress_kd{suffix}_{it:04d}.png"),
+                                               texture.rgb_to_srgb(m['kd']))
                         if FLAGS.bake_mode == 'full_pbr':
                             texture.save_texture2D(os.path.join(FLAGS.out_dir, f"progress_ks{suffix}_{it:04d}.png"),
                                                    m['ks'])
-                            texture.save_texture2D(os.path.join(FLAGS.out_dir, f"progress_nrm{suffix}_{it:04d}.png"),
-                                                   m['normal'])
+                            texture.save_texture2D(
+                                os.path.join(FLAGS.out_dir, f"progress_nrm{suffix}_{it:04d}.png"), m['normal'])
+                    util.save_image(os.path.join(FLAGS.out_dir, f"progress_render_{it:04d}.png"),
+                                    vis[0].detach().cpu().numpy())
 
-                    comp_path = os.path.join(FLAGS.out_dir, f"progress_render_{it:04d}.png")
-                    util.save_image(comp_path, vis[0].detach().cpu().numpy())
-
-                if do_display:
-                    max_w = FLAGS.max_display_width
-                    curr_w = vis.shape[2]
-                    if curr_w > max_w:
-                        scale = max_w / curr_w
-                        new_h = int(vis.shape[1] * scale)
-                        vis_resized = util.scale_img_nhwc(vis, [new_h, max_w])
-                        img_to_show = vis_resized[0].detach().cpu().numpy()
-                    else:
-                        img_to_show = vis[0].detach().cpu().numpy()
-                    util.display_image(img_to_show, title=f"Iter {it}")
+                # 用完立刻释放
+                del buffers, opt_v, ref_v, vis
 
     # 6. Final Export
     print(f"\n[5/5] Exporting...")

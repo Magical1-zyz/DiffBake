@@ -495,6 +495,7 @@ def _save_gltf_impl(folder, mesh_obj, diffuse_only, multi):
             "mode": 4
         })
 
+    # 构建 JSON 结构
     gltf_json = {
         "asset": {"version": "2.0"},
         "buffers": [{"uri": bin_name, "byteLength": len(buffer_data)}],

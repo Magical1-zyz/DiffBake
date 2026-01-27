@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 import argparse
 import json
@@ -8,6 +9,8 @@ import nvdiffrast.torch as dr
 import xatlas
 import matplotlib.cm
 import cv2
+import gc
+import psutil
 
 # 核心模块引用
 from dataset.dataset_mesh import DatasetMesh
@@ -90,9 +93,11 @@ def composite_background(image_rgba, bg_color):
     if bg_color.ndim == 1:
         bg = bg_color.view(1, 1, 1, 3).to(image_rgba.device)
     # 如果背景是图片 [1, H, W, 3]，直接使用
+    else:
+        bg = bg_color
 
     # 3. 合成
-    return rgb * alpha + bg_color * (1.0 - alpha)
+    return rgb * alpha + bg * (1.0 - alpha)
 
 
 @torch.no_grad()
@@ -250,6 +255,9 @@ def process_mesh_uvs(base_mesh, multi_materials=False, use_custom_uv=False):
     # 内部辅助函数：构建新 Mesh 并映射法线
     def build_new_mesh(v_pos_in, t_pos_idx_in, v_nrm_in, vmapping, indices, uvs, materials_list=None,
                        face_mat_idx=None):
+        if vmapping.shape[0] == 0 or indices.shape[0] == 0:
+            raise RuntimeError(f"xatlas error: Output mesh empty. Input had {v_pos_in.shape[0]} verts.")
+
         indices_int64 = indices.astype(np.uint64, casting='same_kind').view(np.int64)
 
         # 1. 映射顶点位置
@@ -280,6 +288,10 @@ def process_mesh_uvs(base_mesh, multi_materials=False, use_custom_uv=False):
     if not multi_materials:
         print(f"      [UV] Mode: Single Material Atlas (Running xatlas...)")
         start_x = time.time()
+
+        if v_pos.shape[0] == 0 or t_pos_idx.shape[0] == 0:
+            raise RuntimeError(f"Input mesh empty! V={v_pos.shape[0]}, F={t_pos_idx.shape[0]}")
+
         vmapping, indices, uvs = xatlas.parametrize(v_pos, t_pos_idx)
         print(
             f"           xatlas finished in {time.time() - start_x:.2f}s. Tris: {t_pos_idx.shape[0]} -> {indices.shape[0]}")
@@ -300,6 +312,10 @@ def process_mesh_uvs(base_mesh, multi_materials=False, use_custom_uv=False):
             mask = (mat_indices == m_id)
             sub_faces_global = t_pos_idx[mask]
 
+            if sub_faces_global.shape[0] == 0:
+                print(f"           Skipping mat ID {m_id} (0 faces).")
+                continue
+
             # 提取子网格
             used_v, sub_faces_local = np.unique(sub_faces_global, return_inverse=True)
             sub_faces_local = sub_faces_local.reshape(-1, 3)
@@ -307,6 +323,10 @@ def process_mesh_uvs(base_mesh, multi_materials=False, use_custom_uv=False):
             sub_v_nrm = v_nrm_orig[used_v]  # 提取对应的正确法线
 
             vmapping, indices, uvs = xatlas.parametrize(sub_v_pos, sub_faces_local)
+
+            if vmapping.shape[0] == 0:
+                print(f"           [Warning] xatlas returned 0 verts for mat ID {m_id}. Skipping.")
+                continue
 
             # 映射属性
             final_v.append(sub_v_pos[vmapping])
@@ -318,6 +338,9 @@ def process_mesh_uvs(base_mesh, multi_materials=False, use_custom_uv=False):
             global_v_offset += vmapping.shape[0]
             active_mat_ids.append(m_id)
         print(f"           xatlas finished in {time.time() - start_x:.2f}s")
+
+        if len(final_f) == 0:
+            raise RuntimeError("All materials failed UV generation!")
 
         indices_int64 = np.concatenate(final_f, axis=0).astype(np.uint64, casting='same_kind').view(np.int64)
 
@@ -339,88 +362,11 @@ def process_mesh_uvs(base_mesh, multi_materials=False, use_custom_uv=False):
 # 主程序
 # ----------------------------------------------------------------------------
 
-def main():
-    parser = argparse.ArgumentParser(description='Texture Baking Tool')
-
-    # 基础参数
-    parser.add_argument('--config', type=str, default=None, help='Config JSON file')
-    parser.add_argument('-rm', '--ref_mesh', type=str, default=None, help='High-poly reference')
-    parser.add_argument('-bm', '--base_mesh', type=str, default=None, help='Low-poly target')
-    parser.add_argument('-o', '--out-dir', type=str, default='out/baking_result')
-
-    # 烘焙选项
-    parser.add_argument('--multi_materials', type=_str2bool, nargs='?', const=True, default=False)
-    parser.add_argument('--use_custom_uv', type=_str2bool, nargs='?', const=True, default=False)
-    parser.add_argument('--texture_res', nargs=2, type=int, default=[4096, 4096])
-    parser.add_argument('--use_opt_pbr', type=_str2bool, nargs='?', const=True, default=False,
-                        help='Use PBR shading for the optimized mesh (Default: Unlit/KD only)')
-    parser.add_argument('--bake_mode', type=str, default='full_pbr', choices=['color_only', 'full_pbr'],
-                        help='color_only: Optimize Kd only; full_pbr: Optimize Kd, Ks, Normal')
-
-    # 训练参数
-    parser.add_argument('--iter', type=int, default=3000)
-    parser.add_argument('--batch', type=int, default=1)
-    parser.add_argument('--lr', type=float, default=0.03)
-    parser.add_argument('--train_res', nargs=2, type=int, default=[1024, 1024])
-    parser.add_argument('--spp', type=int, default=2)
-    parser.add_argument('--loss_type', type=str, default='logl1')
-    parser.add_argument('--smooth_weight', type=float, default=0.02)
-    parser.add_argument('--coarse_to_fine', type=_str2bool, nargs='?', const=True, default=True)
-    parser.add_argument('--amp', type=_str2bool, nargs='?', const=True, default=True)
-
-    # 环境与相机
-    parser.add_argument('--envmap', type=str, default=None)
-    parser.add_argument('--env_scale', type=float, default=1.0)
-    parser.add_argument('--cam_radius_scale', type=float, default=2.0)
-    parser.add_argument('--cam_near_far', nargs=2, type=float, default=[0.1, 1000.0])
-    parser.add_argument('--background_rgb', nargs=3, type=float, default=[0.0, 0.0, 0.0])
-    parser.add_argument('--cam_views_top', type=int, default=64, help='Number of views for top hemisphere')
-    parser.add_argument('--cam_views_bottom', type=int, default=16, help='Number of views for bottom hemisphere')
-
-    # 显示与导出
-    parser.add_argument('--display_interval', type=int, default=50)
-    parser.add_argument('--save_interval', type=int, default=100)
-    parser.add_argument('--max_display_width', type=int, default=1600)
-
-    # 是否渲染 HDR 环境背景
-    parser.add_argument('--render_env_bg', type=_str2bool, nargs='?', const=True, default=False,
-                        help='Render HDR environment map as background in visualization')
-
-    FLAGS = parser.parse_args()
-
-    if FLAGS.config is not None:
-        if not os.path.exists(FLAGS.config):
-            raise FileNotFoundError(f"Config file not found: {FLAGS.config}")
-        data = json.load(open(FLAGS.config, 'r'))
-        for key in data:
-            if hasattr(FLAGS, key):
-                FLAGS.__dict__[key] = data[key]
-
-    if FLAGS.ref_mesh is None: raise ValueError("Reference mesh required.")
-    if FLAGS.base_mesh is None: raise ValueError("Base mesh required.")
-
-    # 逻辑判断：如果开了 use_opt_pbr 或者 bake_mode 是 full_pbr，通常都得用 pbr shader
-    target_bsdf = 'pbr' if (FLAGS.use_opt_pbr or FLAGS.bake_mode == 'full_pbr') else 'kd'
-
-    print(f"\n=== Texture Baking Config ===")
-    print(f" Ref: {FLAGS.ref_mesh}")
-    print(f" Base: {FLAGS.base_mesh}")
-    print(f" Output: {FLAGS.out_dir}")
-    print(f" Loss: {FLAGS.loss_type} (Smooth: {FLAGS.smooth_weight})")
-    print(f" Multi-Mat: {FLAGS.multi_materials}")
-    print(f" Custom UV: {FLAGS.use_custom_uv}")
-    print(
-        f" Bake Mode: {FLAGS.bake_mode.upper()} (Optimizing: {'Kd' if FLAGS.bake_mode == 'color_only' else 'Kd, Ks, Normal'})")
-    print(f" Texture Res: {FLAGS.texture_res}")
-    print(f" Background: {FLAGS.background_rgb}")
-    print(f" Coarse-to-Fine: {FLAGS.coarse_to_fine}")
-    print(f" AMP: {FLAGS.amp}")
-    print(f"=============================\n")
-
+def run_training(FLAGS):
     os.makedirs(FLAGS.out_dir, exist_ok=True)
     glctx = dr.RasterizeGLContext()
     bg_tensor = torch.tensor(FLAGS.background_rgb, dtype=torch.float32, device='cuda')
-    scaler = torch.cuda.amp.GradScaler(enabled=FLAGS.amp)
+    scaler = torch.amp.GradScaler('cuda', enabled=FLAGS.amp)
 
     # 1. Load & Process Meshes
     print(f"[1/5] Processing Meshes...")
@@ -478,6 +424,8 @@ def main():
     print(f"[3/5] Setup Optimization...")
     geometry = DLMesh(base_mesh, FLAGS)
     train_mats, params = [], []
+
+    target_bsdf = 'pbr' if (FLAGS.use_opt_pbr or FLAGS.bake_mode == 'full_pbr') else 'kd'
 
     # 默认值
     ks_val = [0.0, 0.5, 0.0]
@@ -540,10 +488,13 @@ def main():
     start_t = time.time()
 
     # 梯度累积配置
-    # config 中的 batch 作为 "Virtual Batch" (累积多少次更新一次权重)
-    # physical_batch_size 强制为 1，确保最低显存占用
     virtual_batch_size = FLAGS.batch
-    physical_batch_size = 1
+    if FLAGS.enable_batch_split:
+        physical_batch_size = 1
+        print(f" [Info] Gradient Accumulation ENABLED. Virtual Batch: {virtual_batch_size}, Physical Batch: 1")
+    else:
+        physical_batch_size = virtual_batch_size
+        print(f" [Info] Gradient Accumulation DISABLED. Physical Batch: {virtual_batch_size}")
 
     def get_batch(n, b):
         while True:
@@ -572,12 +523,11 @@ def main():
         total_loss_val = 0.0
 
         # 将大 Batch 拆分成微批次 (Micro-batches)，这里每次只跑 1 张
-        # 例如 idxs=[0,1,2,3], 拆分为 [0], [1], [2], [3]
         sub_batches = [idxs[i:i + physical_batch_size] for i in range(0, len(idxs), physical_batch_size)]
 
         # 梯度累积循环
         for sub_idx in sub_batches:
-            # 1. 准备单张图片的数据
+            # 1. 准备图片数据
             mvp = torch.cat([views[i]['mvp'] for i in sub_idx])
             campos = torch.cat([views[i]['campos'] for i in sub_idx])
             target = torch.cat([target_images[i].to('cuda', non_blocking=True) for i in sub_idx])
@@ -596,7 +546,7 @@ def main():
                 # 3. 计算 Loss
                 loss, stats = criterion(buffers['shaded'], target, buffers.get('kd_grad', None))
 
-                # [关键] 归一化 Loss：除以累积步数，保证梯度幅值正确
+                # 归一化 Loss：除以累积步数，保证梯度幅值正确
                 loss = loss / len(sub_batches)
 
             # 4. 反向传播 (积累梯度)
@@ -604,7 +554,7 @@ def main():
 
             total_loss_val += loss.item() * len(sub_batches)  # 还原用于打印的 loss
 
-            # 5. [关键] 立即释放中间变量显存
+            # 5. 显存回收
             del buffers, target, loss, mvp, campos
 
         # 所有微批次跑完后，执行一步优化
@@ -621,25 +571,24 @@ def main():
                 m['kd'].clamp_()
                 if FLAGS.bake_mode == 'full_pbr':
                     m['ks'].clamp_()
-                    # normal map 不需要 clamp，因为 texture.py 里有专门的处理或者它本身是无限范围
-                    # 但为了安全通常不需要 clamp (0,1)
 
         if it % 50 == 0:
-            # 这里打印的 Loss 是累积后的总 Loss，等价于普通 Batch 模式下的 Loss
             print(f"      Iter {it:04d} [{curr_res[0]}x{curr_res[1]}] | Loss: {total_loss_val / len(sub_batches):.6f}")
 
         # 可视化/保存逻辑
-        if (FLAGS.save_interval and it % FLAGS.save_interval == 0) or (
-                FLAGS.display_interval and it % FLAGS.display_interval == 0):
+        # 补全逻辑：只要满足 display 或 save 任意一个，就保存进度图
+        do_save = (FLAGS.save_interval and it % FLAGS.save_interval == 0)
+        do_display = (FLAGS.display_interval and it % FLAGS.display_interval == 0)
+
+        if do_save or do_display:
             with torch.no_grad():
-                # 为了不占用显存，我们只重新渲染第一张图用于预览
-                idx = 0;
-                view_id = idxs[idx];
+                # 重新渲染一张用于显示
+                idx = 0
+                view_id = idxs[idx]
                 view_data = views[view_id]
-                mvp = view_data['mvp'];
+                mvp = view_data['mvp']
                 campos = view_data['campos']
 
-                # 临时渲染一张
                 buffers = render.render_mesh(glctx, geometry.mesh, mvp, campos, lgt, curr_res, spp=curr_spp,
                                              msaa=True, bsdf=target_bsdf)
                 opt_v = buffers['shaded']
@@ -656,15 +605,15 @@ def main():
 
                 vis_opt = composite_background(opt_v, bg_img)
                 vis_ref = composite_background(ref_v, bg_img)
-                vis_opt = vis_opt / (1.0 + vis_opt);
+                vis_opt = vis_opt / (1.0 + vis_opt)
                 vis_ref = vis_ref / (1.0 + vis_ref)
-                vis_opt_srgb = util.rgb_to_srgb(vis_opt);
+                vis_opt_srgb = util.rgb_to_srgb(vis_opt)
                 vis_ref_srgb = util.rgb_to_srgb(vis_ref)
                 mask_v = ref_v[..., 3:4]
                 diff_v = generate_heatmap(buffers['shaded'][..., 0:3], ref_v[..., 0:3], mask_v, bg_tensor)
                 vis = torch.cat([vis_opt_srgb, vis_ref_srgb, diff_v], dim=2)
 
-                if FLAGS.save_interval and it % FLAGS.save_interval == 0:
+                if do_save:
                     for i, m in enumerate(train_mats):
                         suffix = f"_mat{i}" if len(train_mats) > 1 else ""
                         texture.save_texture2D(os.path.join(FLAGS.out_dir, f"progress_kd{suffix}_{it:04d}.png"),
@@ -674,8 +623,24 @@ def main():
                                                    m['ks'])
                             texture.save_texture2D(
                                 os.path.join(FLAGS.out_dir, f"progress_nrm{suffix}_{it:04d}.png"), m['normal'])
+                    # 保存带编号的进度图
                     util.save_image(os.path.join(FLAGS.out_dir, f"progress_render_{it:04d}.png"),
                                     vis[0].detach().cpu().numpy())
+
+                # 找回中间展示: 这里会弹出 OpenGL 窗口
+                if do_display:
+                    max_w = FLAGS.max_display_width
+                    curr_w = vis.shape[2]
+                    if curr_w > max_w:
+                        scale = max_w / curr_w
+                        new_h = int(vis.shape[1] * scale)
+                        vis_resized = util.scale_img_nhwc(vis, [new_h, max_w])
+                        img_to_show = vis_resized[0].detach().cpu().numpy()
+                    else:
+                        img_to_show = vis[0].detach().cpu().numpy()
+
+                    # 调用工具类进行弹窗显示
+                    util.display_image(img_to_show, title=f"Iter {it}")
 
                 # 用完立刻释放
                 del buffers, opt_v, ref_v, vis
@@ -711,6 +676,8 @@ def main():
             psnr = -10.0 * torch.log10(mse + 1e-8)
             total_psnr += psnr.item()
             count += 1
+            # 及时释放
+            del buffers, target_gpu, opt_rgb, ref_rgb
 
     avg_psnr = total_psnr / count if count > 0 else 0.0
     print(f"      Final Average PSNR: {avg_psnr:.2f} dB")
@@ -726,9 +693,15 @@ def main():
         gltf.save_gltf(save_path, final_mesh, diffuse_only=is_diffuse_only)
 
     with torch.no_grad():
-        # 最后一张对比图
+        # 显式重新渲染最后一张，而不是依赖循环遗留变量
         last_idx = len(views) - 1
-        opt_img = buffers['shaded'][0:1]  # 复用上面循环最后一次渲染结果 (正好是最后一张)
+        view_data = views[last_idx]
+
+        # 重新渲染
+        buffers = render.render_mesh(glctx, final_mesh, view_data['mvp'], view_data['campos'], lgt, FLAGS.train_res,
+                                     spp=FLAGS.spp, msaa=True, bsdf=target_bsdf)
+        opt_img = buffers['shaded'][0:1]
+
         # 取回 GPU
         ref_img = target_images[last_idx].to('cuda')
 
@@ -757,7 +730,109 @@ def main():
 
     print(f"Saved to {save_path}")
     print(f"Total time: {time.time() - start_t:.2f}s")
+
+    # Batch Info 输出，供 batch_runner 抓取
+    try:
+        max_vram = torch.cuda.max_memory_allocated() / (1024 ** 3)
+        process = psutil.Process(os.getpid())
+        current_ram = process.memory_info().rss / (1024 ** 3)
+        print(f"[BATCH_INFO] PSNR:{avg_psnr:.2f} VRAM:{max_vram:.2f}GB RAM:{current_ram:.2f}GB")
+    except Exception as e:
+        print(f"[Warning] Failed to export batch info: {e}")
+
     print("[Done]")
+
+
+def main():
+    gc.collect()
+    torch.cuda.empty_cache()
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
+    parser = argparse.ArgumentParser(description='Texture Baking Tool')
+
+    # 基础参数
+    parser.add_argument('--config', type=str, default=None, help='Config JSON file')
+    parser.add_argument('-rm', '--ref_mesh', type=str, default=None, help='High-poly reference')
+    parser.add_argument('-bm', '--base_mesh', type=str, default=None, help='Low-poly target')
+    parser.add_argument('-o', '--out-dir', type=str, default='out/baking_result')
+
+    # 烘焙选项
+    parser.add_argument('--multi_materials', type=_str2bool, nargs='?', const=True, default=False)
+    parser.add_argument('--use_custom_uv', type=_str2bool, nargs='?', const=True, default=False)
+    parser.add_argument('--texture_res', nargs=2, type=int, default=[4096, 4096])
+    parser.add_argument('--use_opt_pbr', type=_str2bool, nargs='?', const=True, default=False,
+                        help='Use PBR shading for the optimized mesh (Default: Unlit/KD only)')
+    parser.add_argument('--bake_mode', type=str, default='full_pbr', choices=['color_only', 'full_pbr'],
+                        help='color_only: Optimize Kd only; full_pbr: Optimize Kd, Ks, Normal')
+
+    # 训练参数
+    parser.add_argument('--iter', type=int, default=3000)
+    parser.add_argument('--batch', type=int, default=1)
+    parser.add_argument('--lr', type=float, default=0.03)
+    parser.add_argument('--train_res', nargs=2, type=int, default=[1024, 1024])
+    parser.add_argument('--spp', type=int, default=2)
+    parser.add_argument('--loss_type', type=str, default='logl1')
+    parser.add_argument('--smooth_weight', type=float, default=0.02)
+    parser.add_argument('--coarse_to_fine', type=_str2bool, nargs='?', const=True, default=True)
+    parser.add_argument('--amp', type=_str2bool, nargs='?', const=True, default=True)
+    parser.add_argument('--enable_batch_split', type=_str2bool, nargs='?', const=True, default=True,
+                        help='Split batch into micro-batches (size 1) to save VRAM')
+
+    # 环境与相机
+    parser.add_argument('--envmap', type=str, default=None)
+    parser.add_argument('--env_scale', type=float, default=1.0)
+    parser.add_argument('--cam_radius_scale', type=float, default=2.0)
+    parser.add_argument('--cam_near_far', nargs=2, type=float, default=[0.1, 1000.0])
+    parser.add_argument('--background_rgb', nargs=3, type=float, default=[0.0, 0.0, 0.0])
+    parser.add_argument('--cam_views_top', type=int, default=64, help='Number of views for top hemisphere')
+    parser.add_argument('--cam_views_bottom', type=int, default=16, help='Number of views for bottom hemisphere')
+
+    # 显示与导出
+    parser.add_argument('--display_interval', type=int, default=50)
+    parser.add_argument('--save_interval', type=int, default=100)
+    parser.add_argument('--max_display_width', type=int, default=1600)
+
+    # 是否渲染 HDR 环境背景
+    parser.add_argument('--render_env_bg', type=_str2bool, nargs='?', const=True, default=False,
+                        help='Render HDR environment map as background in visualization')
+
+    FLAGS = parser.parse_args()
+
+    if FLAGS.config is not None:
+        if not os.path.exists(FLAGS.config):
+            raise FileNotFoundError(f"Config file not found: {FLAGS.config}")
+        data = json.load(open(FLAGS.config, 'r'))
+        for key in data:
+            if hasattr(FLAGS, key):
+                FLAGS.__dict__[key] = data[key]
+
+    if FLAGS.ref_mesh is None: raise ValueError("Reference mesh required.")
+    if FLAGS.base_mesh is None: raise ValueError("Base mesh required.")
+
+    print(f"\n=== Texture Baking Config ===")
+    print(f" Ref: {FLAGS.ref_mesh}")
+    print(f" Base: {FLAGS.base_mesh}")
+    print(f" Output: {FLAGS.out_dir}")
+    print(
+        f" Bake Mode: {FLAGS.bake_mode.upper()} (Optimizing: {'Kd' if FLAGS.bake_mode == 'color_only' else 'Kd, Ks, Normal'})")
+    print(f" Texture Res: {FLAGS.texture_res}")
+    print(f" Train Res: {FLAGS.train_res} (Physical Batch: 1, Gradient Accumulation: {FLAGS.batch})")
+    print(f"=============================\n")
+
+    # 捕获异常，防止整个 Batch 崩溃
+    try:
+        run_training(FLAGS)
+    except torch.cuda.OutOfMemoryError:
+        print(f"\n[Error] CUDA Out Of Memory! Even with physical batch=1, the model/resolution is too large.")
+        print(f"        Skipping optimization for this model.")
+        gc.collect()
+        torch.cuda.empty_cache()
+        sys.exit(1)
+    except Exception as e:
+        print(f"\n[Error] An unexpected error occurred: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
 
 
 if __name__ == "__main__":

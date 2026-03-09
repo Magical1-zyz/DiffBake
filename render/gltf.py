@@ -359,8 +359,10 @@ def _save_gltf_impl(folder, mesh_obj, diffuse_only, multi):
     bin_filename = os.path.join(folder, bin_name)
     gltf_filename = os.path.join(folder, gltf_name)
 
+    # 提取位置、UV 和 核心新增：法线！
     V = mesh_obj.v_pos.detach().cpu().numpy().astype(np.float32)
     UV = mesh_obj.v_tex.detach().cpu().numpy().astype(np.float32) if mesh_obj.v_tex is not None else None
+    N = mesh_obj.v_nrm.detach().cpu().numpy().astype(np.float32) if mesh_obj.v_nrm is not None else None
     F = mesh_obj.t_pos_idx.detach().cpu().numpy()
 
     buffer_data = bytearray()
@@ -389,6 +391,12 @@ def _save_gltf_impl(folder, mesh_obj, diffuse_only, multi):
     if UV is not None:
         uv_view = add_buffer_view(UV.tobytes(), 34962)
         uv_idx = add_accessor(uv_view, 5126, UV.shape[0], "VEC2")
+
+    # [新增] 处理法线 Accessor
+    nrm_idx = None
+    if N is not None:
+        nrm_view = add_buffer_view(N.tobytes(), 34962)
+        nrm_idx = add_accessor(nrm_view, 5126, N.shape[0], "VEC3")
 
     images = []
     textures = []
@@ -456,6 +464,15 @@ def _save_gltf_impl(folder, mesh_obj, diffuse_only, multi):
 
         materials.append(mat_def)
 
+    # 辅助函数：构建 attributes 字典，动态加入存在的几何数据
+    def build_attributes():
+        attrs = {"POSITION": pos_idx}
+        if uv_idx is not None:
+            attrs["TEXCOORD_0"] = uv_idx
+        if nrm_idx is not None:
+            attrs["NORMAL"] = nrm_idx  # [重要修复] 把法线导出
+        return attrs
+
     if multi and mesh_obj.face_material_idx is not None:
         MF = mesh_obj.face_material_idx.detach().cpu().numpy()
         unique_mats = np.unique(MF)
@@ -473,8 +490,7 @@ def _save_gltf_impl(folder, mesh_obj, diffuse_only, multi):
             ind_idx = add_accessor(add_buffer_view(ind_bytes, 34963), comp, sub_faces.shape[0], "SCALAR")
 
             primitives.append({
-                "attributes": {"POSITION": pos_idx, "TEXCOORD_0": uv_idx} if uv_idx is not None else {
-                    "POSITION": pos_idx},
+                "attributes": build_attributes(),
                 "indices": ind_idx,
                 "material": int(m_id),
                 "mode": 4
@@ -489,7 +505,7 @@ def _save_gltf_impl(folder, mesh_obj, diffuse_only, multi):
             comp = 5125
         ind_idx = add_accessor(add_buffer_view(ind_bytes, 34963), comp, indices_flat.shape[0], "SCALAR")
         primitives.append({
-            "attributes": {"POSITION": pos_idx, "TEXCOORD_0": uv_idx} if uv_idx is not None else {"POSITION": pos_idx},
+            "attributes": build_attributes(),
             "indices": ind_idx,
             "material": 0,
             "mode": 4

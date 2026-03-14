@@ -110,10 +110,12 @@ def main():
             continue
 
         # 6. 生成配置内容
-        model_rel_path = f"data/simModels/{folder_name}/{model_filename}"
+        model_rel_path = os.path.join(MODELS_ROOT_DIR, folder_name, model_filename)
+        model_rel_path = model_rel_path.replace("\\", "/")  # 确保路径分隔符统一为 /
 
         # 输出路径
-        out_dir_path = f"out/ours/{folder_name}"
+        out_dir_path = os.path.join(OUTPUT_ROOT_DIR, folder_name)
+        out_dir_path = out_dir_path.replace("\\", "/")  # 确保路径分隔符统一为 /
 
         new_config = TEMPLATE_CONFIG.copy()
         new_config["base_mesh"] = model_rel_path

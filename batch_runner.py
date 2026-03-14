@@ -3,12 +3,13 @@ import sys
 import subprocess
 import time
 import glob
+import gc
+import csv  # [新增] 用于导出CSV
 
 # ================= 配置区域 =================
 
 # 模式 A: 手动指定要运行的 Config 文件列表 (相对路径)
 # 优先级最高。如果这里有内容 (不为空)，脚本将只运行列表里的文件，忽略模式 B。
-# 示例: ["configs/SM_RedHouse.json", "configs/SM_Building.json"]
 MANUAL_CONFIG_LIST = [
 
 ]
@@ -18,125 +19,271 @@ MANUAL_CONFIG_LIST = [
 AUTO_SCAN_DIR = "configs"
 
 # 排除列表 (文件名): 在自动扫描模式下，如果你想跳过某些特定的 JSON 文件，写在这里
-# 示例: ["template.json", "base_config.json"]
 EXCLUDE_FILES = [
-
+    # "bagonghouse.json",
+    # "Build_corner.json",
+    # "Build_double_corner.json",
+    # "Build_entrance.json",
+    # "Build_entrance_big.json",
+    # "Build_middle.json",
+    # "building-buildify-nyc.json",
+    # "City_Building_Downtown.json",
+    # "dock_pier.json",
+    # "doreamonhouse.json",
+    # "psx_abandoned_house.json",
+    # "realistic_wooden_cottage_garden_house.json",
+    # "SM_BagongHouse2.json",
+    # "SM_KRHistoricalGovernmentOffice.json",
+    "test.json",
+    "SM_BagongHouse2.json",
+    # "wooden_house.json",
+    # "SM_Bp_Building01_C_1.json",
+    # "SM_Bp_Building02_C_1.json",
+    # "SM_Bp_Building03_C_1.json",
+    # "SM_Bp_Building04_C_1.json",
+    # "SM_Bp_Building05_C_1.json",
+    # "SM_Bp_Building06_C_1.json",
+    # "SM_Bp_Building07_C_1.json",
+    # "SM_Bp_Building08_C_1.json",
+    # "SM_Bp_Building09_C_1.json",
+    # "SM_Bp_Building10_C_1.json",
+    # "SM_RedHouse1.json",
+    # "SM_RedHouse2.json",
+    # "SM_RedHouse3.json",
+    # "SM_RedHouse4.json",
+    # "SM_RedHouse5.json",
+    # "SM_RedHouse6.json",
+    # "Free_Small_Old_House.json",
+    # "SM_Group_117.json",
+    # "SM_Group_16_rec_9.json ",
+    # "SM_Group_38_16.json",
+    # "SM_Group_38_9.json",
+    # "SM_Group_76_0_0.json",
+    # "SM_Group_8_10_left.json",
+    # "SM_Group_8_11.json",
+    # "SM_Group_8_3.json"
 ]
+
+# 任务间隔冷却时间 (秒)
+COOLDOWN_TIME = 15
 
 # Python解释器路径
 PYTHON_EXECUTABLE = sys.executable
 
+# 结果导出文件名
+CSV_FILENAME = "batch_report_4.csv"
+
 
 # =========================================
 
-def run_command(command):
-    """执行系统命令并实时输出日志"""
-    print(f"\n[Batch] Executing: {command}")
-    print("-" * 60)
+class BatchRunner:
+    def __init__(self, manual_list, auto_dir, exclude_files, cooldown, python_exe):
+        """初始化 Runner"""
+        self.manual_list = manual_list
+        self.auto_dir = auto_dir
+        self.exclude_files = exclude_files
+        self.cooldown = cooldown
+        self.python_exe = python_exe
 
-    try:
-        start_time = time.time()
-        # Windows下通常需要 shell=True
-        result = subprocess.run(command, shell=True, check=True)
-        duration = time.time() - start_time
-        return True, duration
-    except subprocess.CalledProcessError as e:
-        print(f"\n[Batch] Error: Task failed with return code {e.returncode}")
-        return False, 0.0
-    except KeyboardInterrupt:
-        print("\n[Batch] Interrupted by user.")
-        sys.exit(1)
+        # 存储结果数据: [(Config, Time, Status, PSNR, VRAM, RAM), ...]
+        self.report_data = []
+        self.success_count = 0
+        self.fail_list = []
 
-
-def main():
-    # 1. 确定任务列表
-    tasks = []
-
-    if len(MANUAL_CONFIG_LIST) > 0:
-        print(f"[Batch] Mode: Manual List ({len(MANUAL_CONFIG_LIST)} items)")
-        tasks = MANUAL_CONFIG_LIST
-    else:
-        print(f"[Batch] Mode: Auto Scan directory '{AUTO_SCAN_DIR}'")
-        # 直接匹配所有 .json 文件
-        search_pattern = os.path.join(AUTO_SCAN_DIR, "*.json")
-        files = glob.glob(search_pattern)
-
-        # 过滤排除列表
-        files = [f for f in files if os.path.basename(f) not in EXCLUDE_FILES]
-
-        # 按文件名排序，保证执行顺序一致
-        tasks = sorted(files)
-        print(f"[Batch] Found {len(tasks)} configs.")
-
-    if not tasks:
-        print("[Batch] No config files found to run.")
-        print(f"        Please check directory: {AUTO_SCAN_DIR}")
-        return
-
-    print(f"\n[Batch] Task Queue:")
-    for idx, t in enumerate(tasks):
-        print(f"  {idx + 1}. {t}")
-
-    print("\n[Batch] Start processing...")
-    print("=" * 60)
-
-    # 2. 循环执行
-    success_count = 0
-    fail_list = []
-    report = []
-
-    total_start = time.time()
-
-    for i, config_path in enumerate(tasks):
-        # 检查文件是否存在
-        if not os.path.exists(config_path):
-            print(f"[Batch] Skipping {config_path}: File not found.")
-            fail_list.append(config_path)
-            report.append((config_path, "0.0s", "MISSING"))
-            continue
-
-        print(f"\n>>> Task {i + 1}/{len(tasks)}: {config_path}")
-
-        # 构造命令
-        cmd = f'"{PYTHON_EXECUTABLE}" train.py --config "{config_path}"'
-
-        # 执行
-        success, duration = run_command(cmd)
-
-        if success:
-            success_count += 1
-            report.append((config_path, f"{duration:.1f}s", "OK"))
-            print(f">>> Task {i + 1} Finished in {duration:.1f}s")
+    def get_tasks(self):
+        """获取任务列表"""
+        tasks = []
+        if len(self.manual_list) > 0:
+            print(f"[Batch] Mode: Manual List ({len(self.manual_list)} items)")
+            tasks = self.manual_list
         else:
-            fail_list.append(config_path)
-            report.append((config_path, "0.0s", "FAILED"))
-            print(f">>> Task {i + 1} FAILED. Continuing to next task...")
+            print(f"[Batch] Mode: Auto Scan directory '{self.auto_dir}'")
+            search_pattern = os.path.join(self.auto_dir, "*.json")
+            files = glob.glob(search_pattern)
+            # 过滤排除列表
+            files = [f for f in files if os.path.basename(f) not in self.exclude_files]
+            # 按文件名排序
+            tasks = sorted(files)
+            print(f"[Batch] Found {len(tasks)} configs.")
+        return tasks
 
-        # (可选) 任务间隔休息，防止显卡过热
-        if i < len(tasks) - 1:
-            time.sleep(2)
+    def run_single_task(self, command):
+        """执行单个任务并捕获输出"""
+        print(f"\n[Batch] Executing: {command}")
+        print("-" * 60)
 
-    # 3. 最终总结
-    total_duration = time.time() - total_start
-    print("\n" + "=" * 60)
-    print(f"Batch Processing Complete.")
-    print(f"Total Time: {total_duration / 60:.1f} minutes")
-    print(f"Success: {success_count} | Failed: {len(fail_list)}")
-    print("-" * 60)
+        start_time = time.time()
+        captured_info = {"PSNR": "N/A", "VRAM": "N/A", "RAM": "N/A"}
+        success = False
 
-    # 打印格式化的报告表
-    # 动态调整列宽以适应长文件名
-    max_name_len = max([len(t[0]) for t in report]) if report else 40
-    max_name_len = max(max_name_len, 20)  # 最小宽度
+        try:
+            # 启动子进程
+            process = subprocess.Popen(
+                command,
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding='utf-8',
+                errors='replace'
+            )
 
-    header = f"{'Config File':<{max_name_len}} | {'Time':<10} | {'Status'}"
-    print(header)
-    print("-" * len(header))
+            # 实时读取输出
+            while True:
+                line = process.stdout.readline()
+                if not line and process.poll() is not None:
+                    break
+                if line:
+                    print(line.rstrip())  # 实时打印
+                    # 抓取 [BATCH_INFO]
+                    if "[BATCH_INFO]" in line:
+                        try:
+                            parts = line.split()
+                            for p in parts:
+                                if "PSNR:" in p: captured_info["PSNR"] = p.split(":")[1]
+                                if "VRAM:" in p: captured_info["VRAM"] = p.split(":")[1]
+                                if "RAM:" in p:  captured_info["RAM"] = p.split(":")[1]
+                        except:
+                            pass
 
-    for name, time_str, status in report:
-        print(f"{name:<{max_name_len}} | {time_str:<10} | {status}")
-    print("=" * 60)
+            return_code = process.poll()
+            duration = time.time() - start_time
+            success = (return_code == 0)
+
+            if not success:
+                print(f"\n[Batch] Error: Task failed with return code {return_code}")
+
+        except KeyboardInterrupt:
+            print("\n[Batch] Interrupted by user.")
+            sys.exit(1)
+        except Exception as e:
+            print(f"\n[Batch] Execution Exception: {e}")
+            duration = time.time() - start_time
+            success = False
+
+        return success, duration, captured_info
+
+    def cleanup(self):
+        """清理资源"""
+        print(f"[Batch] Cooling down for {self.cooldown} seconds to release VRAM...")
+        gc.collect()
+        time.sleep(self.cooldown)
+
+    def print_summary_table(self):
+        """打印控制台汇总表"""
+        if not self.report_data:
+            return
+
+        headers = ["Config File", "Time", "Status", "PSNR", "VRAM", "RAM"]
+
+        # 自动计算列宽
+        col_widths = [len(h) for h in headers]
+        for row in self.report_data:
+            for j, val in enumerate(row):
+                col_widths[j] = max(col_widths[j], len(str(val)))
+
+        col_widths = [w + 2 for w in col_widths]  # Padding
+        row_fmt = "".join([f"{{:<{w}}}" for w in col_widths])
+
+        print("-" * 90)
+        print(row_fmt.format(*headers))
+        print("-" * 90)
+        for row in self.report_data:
+            print(row_fmt.format(*row))
+        print("=" * 90)
+
+    def export_to_csv(self, filename):
+        """导出结果到CSV文件"""
+        if not self.report_data:
+            print("[Batch] No data to export.")
+            return
+
+        try:
+            # utf-8-sig 确保 Excel 打开中文不乱码
+            with open(filename, 'w', newline='', encoding='utf-8-sig') as csvfile:
+                writer = csv.writer(csvfile)
+                # 写入表头
+                writer.writerow(["Config File", "Time", "Status", "PSNR", "VRAM", "RAM"])
+                # 写入数据
+                writer.writerows(self.report_data)
+            print(f"[Batch] Report exported successfully to: {os.path.abspath(filename)}")
+        except Exception as e:
+            print(f"[Batch] Failed to export CSV: {e}")
+
+    def run(self):
+        """主运行逻辑"""
+        tasks = self.get_tasks()
+        if not tasks:
+            print("[Batch] No config files found.")
+            return
+
+        print(f"\n[Batch] Task Queue:")
+        for idx, t in enumerate(tasks):
+            print(f"  {idx + 1}. {t}")
+
+        print("\n[Batch] Start processing...")
+        print("=" * 60)
+
+        total_start = time.time()
+
+        for i, config_path in enumerate(tasks):
+            if not os.path.exists(config_path):
+                print(f"[Batch] Skipping {config_path}: File not found.")
+                self.fail_list.append(config_path)
+                self.report_data.append((os.path.basename(config_path), "0.0s", "MISSING", "-", "-", "-"))
+                continue
+
+            print(f"\n>>> Task {i + 1}/{len(tasks)}: {config_path}")
+
+            # 构造命令
+            cmd = f'"{self.python_exe}" train.py --config "{config_path}"'
+
+            # 执行
+            success, duration, info = self.run_single_task(cmd)
+
+            duration_str = f"{duration:.1f}s"
+            config_name = os.path.basename(config_path)
+
+            if success:
+                self.success_count += 1
+                status = "OK"
+                print(f">>> Task {i + 1} Finished in {duration_str}")
+            else:
+                self.fail_list.append(config_path)
+                status = "FAILED"
+                print(f">>> Task {i + 1} FAILED.")
+
+            # 记录数据
+            self.report_data.append((
+                config_name, duration_str, status,
+                info["PSNR"], info["VRAM"], info["RAM"]
+            ))
+
+            # 执行间隔清理 (最后一个任务后不需要)
+            if i < len(tasks) - 1:
+                self.cleanup()
+
+        # 结束总结
+        total_duration = time.time() - total_start
+        print("\n" + "=" * 90)
+        print(f"Batch Processing Complete.")
+        print(f"Total Time: {total_duration / 60:.1f} minutes")
+        print(f"Success: {self.success_count} | Failed: {len(self.fail_list)}")
+
+        # 打印表格
+        self.print_summary_table()
+
+        # 导出CSV
+        self.export_to_csv(CSV_FILENAME)
 
 
 if __name__ == "__main__":
-    main()
+    # 实例化并运行
+    runner = BatchRunner(
+        manual_list=MANUAL_CONFIG_LIST,
+        auto_dir=AUTO_SCAN_DIR,
+        exclude_files=EXCLUDE_FILES,
+        cooldown=COOLDOWN_TIME,
+        python_exe=PYTHON_EXECUTABLE
+    )
+    runner.run()

@@ -1,0 +1,26 @@
+﻿Config File,Time,Status,PSNR,VRAM,RAM
+Build_corner.json,768.0s,OK,41.98,3.01GB,2.46GB
+Build_double_corner.json,764.8s,OK,40.86,3.01GB,2.46GB
+Build_entrance.json,729.4s,OK,41.67,3.01GB,2.50GB
+Build_entrance_big.json,726.5s,OK,41.94,3.01GB,2.50GB
+Build_middle.json,734.6s,OK,42.21,3.01GB,2.46GB
+City_Building_Downtown.json,727.5s,OK,46.21,3.01GB,2.45GB
+DS___016.json,722.6s,OK,35.38,3.01GB,2.50GB
+DS___017.json,727.8s,OK,38.88,3.01GB,2.46GB
+DS___018.json,732.8s,OK,32.27,3.01GB,2.49GB
+DS___019.json,722.6s,OK,31.12,3.01GB,2.46GB
+DS___020.json,720.8s,OK,37.39,3.01GB,2.49GB
+DS___021.json,727.6s,OK,32.16,3.01GB,2.50GB
+DS___022.json,738.3s,OK,33.28,3.01GB,2.46GB
+DS___023.json,730.5s,OK,41.30,3.01GB,2.49GB
+DS___024.json,728.6s,OK,36.67,3.01GB,2.46GB
+DS___025.json,731.0s,OK,36.57,3.01GB,2.46GB
+DS___026.json,727.8s,OK,30.77,3.01GB,2.46GB
+DS___028.json,716.7s,OK,34.33,3.01GB,2.46GB
+DS___029.json,728.2s,OK,34.12,3.01GB,2.46GB
+DS___031.json,730.7s,OK,30.68,3.01GB,2.46GB
+DS___034.json,727.4s,OK,31.10,3.01GB,2.46GB
+DS___038.json,725.8s,OK,32.96,3.01GB,2.46GB
+DS___039.json,725.7s,OK,35.32,3.01GB,2.45GB
+dock_pier.json,729.9s,OK,40.74,3.02GB,2.46GB
+doreamonhouse.json,729.5s,OK,45.60,3.01GB,2.46GB

@@ -4,7 +4,7 @@ import subprocess
 import time
 import glob
 import gc
-import csv  # [新增] 用于导出CSV
+import csv
 
 # ================= 配置区域 =================
 
@@ -16,7 +16,7 @@ MANUAL_CONFIG_LIST = [
 
 # 模式 B: 自动扫描文件夹
 # 如果 MANUAL_CONFIG_LIST 为空，脚本会自动扫描该目录下所有 .json 文件
-AUTO_SCAN_DIR = "configs"
+AUTO_SCAN_DIR = "configs/ablation"
 
 # 排除列表 (文件名): 在自动扫描模式下，如果你想跳过某些特定的 JSON 文件，写在这里
 EXCLUDE_FILES = [
@@ -34,8 +34,8 @@ EXCLUDE_FILES = [
     # "realistic_wooden_cottage_garden_house.json",
     # "SM_BagongHouse2.json",
     # "SM_KRHistoricalGovernmentOffice.json",
-    "test.json",
-    "SM_BagongHouse2.json",
+    # "test.json",
+    # "SM_BagongHouse2.json",
     # "wooden_house.json",
     # "SM_Bp_Building01_C_1.json",
     # "SM_Bp_Building02_C_1.json",
@@ -70,20 +70,27 @@ COOLDOWN_TIME = 15
 # Python解释器路径
 PYTHON_EXECUTABLE = sys.executable
 
+# 结果导出的目标文件夹 (支持多级目录，例如 "out/reports/ablation")
+CSV_OUTPUT_DIR = "reports/ablation_results"
+
 # 结果导出文件名
-CSV_FILENAME = "batch_report_4.csv"
+CSV_FILENAME = "batch_report_ablation.csv"
 
 
 # =========================================
 
 class BatchRunner:
-    def __init__(self, manual_list, auto_dir, exclude_files, cooldown, python_exe):
+    def __init__(self, manual_list, auto_dir, exclude_files, cooldown, python_exe, csv_dir, csv_filename):
         """初始化 Runner"""
         self.manual_list = manual_list
         self.auto_dir = auto_dir
         self.exclude_files = exclude_files
         self.cooldown = cooldown
         self.python_exe = python_exe
+
+        # 保存 CSV 路径信息
+        self.csv_dir = csv_dir
+        self.csv_filename = csv_filename
 
         # 存储结果数据: [(Config, Time, Status, PSNR, VRAM, RAM), ...]
         self.report_data = []
@@ -192,21 +199,32 @@ class BatchRunner:
             print(row_fmt.format(*row))
         print("=" * 90)
 
-    def export_to_csv(self, filename):
+    def export_to_csv(self):
         """导出结果到CSV文件"""
         if not self.report_data:
             print("[Batch] No data to export.")
             return
 
+        # 检查并创建目录
+        if self.csv_dir:
+            try:
+                os.makedirs(self.csv_dir, exist_ok=True)
+            except Exception as e:
+                print(f"[Batch] Warning: Failed to create directory '{self.csv_dir}': {e}")
+
+            full_path = os.path.join(self.csv_dir, self.csv_filename)
+        else:
+            full_path = self.csv_filename
+
         try:
             # utf-8-sig 确保 Excel 打开中文不乱码
-            with open(filename, 'w', newline='', encoding='utf-8-sig') as csvfile:
+            with open(full_path, 'w', newline='', encoding='utf-8-sig') as csvfile:
                 writer = csv.writer(csvfile)
                 # 写入表头
                 writer.writerow(["Config File", "Time", "Status", "PSNR", "VRAM", "RAM"])
                 # 写入数据
                 writer.writerows(self.report_data)
-            print(f"[Batch] Report exported successfully to: {os.path.abspath(filename)}")
+            print(f"[Batch] Report exported successfully to: {os.path.abspath(full_path)}")
         except Exception as e:
             print(f"[Batch] Failed to export CSV: {e}")
 
@@ -274,7 +292,7 @@ class BatchRunner:
         self.print_summary_table()
 
         # 导出CSV
-        self.export_to_csv(CSV_FILENAME)
+        self.export_to_csv()
 
 
 if __name__ == "__main__":
@@ -284,6 +302,8 @@ if __name__ == "__main__":
         auto_dir=AUTO_SCAN_DIR,
         exclude_files=EXCLUDE_FILES,
         cooldown=COOLDOWN_TIME,
-        python_exe=PYTHON_EXECUTABLE
+        python_exe=PYTHON_EXECUTABLE,
+        csv_dir=CSV_OUTPUT_DIR,
+        csv_filename=CSV_FILENAME
     )
     runner.run()

@@ -408,17 +408,24 @@ def run_training(FLAGS):
 
     ref_spp = FLAGS.spp
 
-    with torch.no_grad():
-        for i, view in enumerate(views):
-            if len(dummy_dataset.ref_meshes) == 1:
-                out = render.render_mesh(glctx, dummy_dataset.ref_meshes[0], view['mvp'], view['campos'], lgt,
-                                         FLAGS.train_res, spp=ref_spp, msaa=True)
-            else:
-                out = render.render_meshes(glctx, dummy_dataset.ref_meshes, view['mvp'], view['campos'], lgt,
-                                           FLAGS.train_res, spp=ref_spp, msaa=True)
-            # 存到cpu
-            target_images.append(out['shaded'].detach().cpu())
-            if (i + 1) % 10 == 0: print(f"      Rendered {i + 1}/{len(views)}")
+    # 获取缓存机制开关，默认开启
+    use_gt_cache = getattr(FLAGS, 'use_gt_cache', True)
+
+    if use_gt_cache:
+        print("      [Info] Ground Truth Caching is ENABLED. Pre-rendering all views to RAM...")
+        with torch.no_grad():
+            for i, view in enumerate(views):
+                if len(dummy_dataset.ref_meshes) == 1:
+                    out = render.render_mesh(glctx, dummy_dataset.ref_meshes[0], view['mvp'], view['campos'], lgt,
+                                             FLAGS.train_res, spp=ref_spp, msaa=True)
+                else:
+                    out = render.render_meshes(glctx, dummy_dataset.ref_meshes, view['mvp'], view['campos'], lgt,
+                                               FLAGS.train_res, spp=ref_spp, msaa=True)
+                # 存到cpu缓存
+                target_images.append(out['shaded'].detach().cpu())
+                if (i + 1) % 10 == 0: print(f"      Rendered {i + 1}/{len(views)}")
+    else:
+        print("      [Info] Ground Truth Caching is DISABLED. GT will be rendered on-the-fly.")
 
     # 4. Setup Optimization
     print(f"[3/5] Setup Optimization...")
@@ -530,7 +537,26 @@ def run_training(FLAGS):
             # 1. 准备图片数据
             mvp = torch.cat([views[i]['mvp'] for i in sub_idx])
             campos = torch.cat([views[i]['campos'] for i in sub_idx])
-            target = torch.cat([target_images[i].to('cuda', non_blocking=True) for i in sub_idx])
+
+            # 判断获取 Target (Ground Truth) 的方式
+            if use_gt_cache:
+                # 方式A: 从内存缓存读取并推入 GPU
+                target = torch.cat([target_images[i].to('cuda', non_blocking=True) for i in sub_idx])
+            else:
+                # 方式B: 实时光栅化渲染高模 (不消耗系统RAM，但极大地增加GPU计算时间)
+                with torch.no_grad():
+                    sub_targets = []
+                    for i in sub_idx:
+                        if len(dummy_dataset.ref_meshes) == 1:
+                            out = render.render_mesh(glctx, dummy_dataset.ref_meshes[0], views[i]['mvp'],
+                                                     views[i]['campos'], lgt,
+                                                     FLAGS.train_res, spp=ref_spp, msaa=True)
+                        else:
+                            out = render.render_meshes(glctx, dummy_dataset.ref_meshes, views[i]['mvp'],
+                                                       views[i]['campos'], lgt,
+                                                       FLAGS.train_res, spp=ref_spp, msaa=True)
+                        sub_targets.append(out['shaded'])
+                    target = torch.cat(sub_targets)
 
             # Resize 目标图 (如果是 coarse 阶段)
             if target.shape[1] != curr_res[0] or target.shape[2] != curr_res[1]:
@@ -593,7 +619,18 @@ def run_training(FLAGS):
                                              msaa=True, bsdf=target_bsdf)
                 opt_v = buffers['shaded']
 
-                ref_v = target_images[view_id].to('cuda', non_blocking=True)
+                # 可视化时获取参考图
+                if use_gt_cache:
+                    ref_v = target_images[view_id].to('cuda', non_blocking=True)
+                else:
+                    if len(dummy_dataset.ref_meshes) == 1:
+                        out_ref = render.render_mesh(glctx, dummy_dataset.ref_meshes[0], mvp, campos, lgt,
+                                                     FLAGS.train_res, spp=ref_spp, msaa=True)
+                    else:
+                        out_ref = render.render_meshes(glctx, dummy_dataset.ref_meshes, mvp, campos, lgt,
+                                                       FLAGS.train_res, spp=ref_spp, msaa=True)
+                    ref_v = out_ref['shaded']
+
                 if ref_v.shape[1] != curr_res[0]:
                     ref_v = torch.nn.functional.interpolate(ref_v.permute(0, 3, 1, 2), size=curr_res,
                                                             mode='bilinear').permute(0, 2, 3, 1)
@@ -664,8 +701,17 @@ def run_training(FLAGS):
                                          spp=FLAGS.spp, msaa=True, bsdf=target_bsdf)
             opt_rgb = torch.clamp(buffers['shaded'][..., 0:3], 0.0, 1.0)
 
-            # 临时从CPU取回ground truth图片到GPU
-            target_gpu = target_images[i].to('cuda')
+            # 计算最终PSNR时获取Target
+            if use_gt_cache:
+                target_gpu = target_images[i].to('cuda')
+            else:
+                if len(dummy_dataset.ref_meshes) == 1:
+                    out_ref = render.render_mesh(glctx, dummy_dataset.ref_meshes[0], view['mvp'], view['campos'], lgt,
+                                                 FLAGS.train_res, spp=ref_spp, msaa=True)
+                else:
+                    out_ref = render.render_meshes(glctx, dummy_dataset.ref_meshes, view['mvp'], view['campos'], lgt,
+                                                   FLAGS.train_res, spp=ref_spp, msaa=True)
+                target_gpu = out_ref['shaded']
 
             ref_rgb = torch.clamp(target_gpu[..., 0:3], 0.0, 1.0)
             mask = target_gpu[..., 3:4] > 0.0
@@ -702,8 +748,19 @@ def run_training(FLAGS):
                                      spp=FLAGS.spp, msaa=True, bsdf=target_bsdf)
         opt_img = buffers['shaded'][0:1]
 
-        # 取回 GPU
-        ref_img = target_images[last_idx].to('cuda')
+        # 生成最终对比图
+        if use_gt_cache:
+            ref_img = target_images[last_idx].to('cuda')
+        else:
+            if len(dummy_dataset.ref_meshes) == 1:
+                out_ref = render.render_mesh(glctx, dummy_dataset.ref_meshes[0], view_data['mvp'], view_data['campos'],
+                                             lgt,
+                                             FLAGS.train_res, spp=ref_spp, msaa=True)
+            else:
+                out_ref = render.render_meshes(glctx, dummy_dataset.ref_meshes, view_data['mvp'], view_data['campos'],
+                                               lgt,
+                                               FLAGS.train_res, spp=ref_spp, msaa=True)
+            ref_img = out_ref['shaded']
 
         # 最终导出也支持环境背景
         if FLAGS.render_env_bg and FLAGS.envmap:
@@ -777,6 +834,8 @@ def main():
     parser.add_argument('--amp', type=_str2bool, nargs='?', const=True, default=True)
     parser.add_argument('--enable_batch_split', type=_str2bool, nargs='?', const=True, default=True,
                         help='Split batch into micro-batches (size 1) to save VRAM')
+    parser.add_argument('--use_gt_cache', type=_str2bool, nargs='?', const=True, default=True,
+                        help='Cache Ground Truth renders in RAM to speed up training')
 
     # 环境与相机
     parser.add_argument('--envmap', type=str, default=None)
